@@ -7,9 +7,9 @@ export const GET = async (request: NextRequest) => {
   // which adds back a redirect to the main app.
   const url = new URL(buildUrl("/auth/oauth/callback"));
   url.search = request.nextUrl.search;
-
+  
   const response = await fetch(url.toString());
-  const setCookieHeader = response.headers.get("set-cookie");
+  const setCookieHeader = response.headers.get("Set-Cookie");
 
   if (!setCookieHeader) {
     return NextResponse.redirect(new URL("/auth/error", getDomain(request)));
