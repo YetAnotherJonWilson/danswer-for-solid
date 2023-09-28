@@ -1,13 +1,13 @@
 import io
-import re
+from copy import copy
 from datetime import datetime
+from enum import Enum
 from typing import Any
 from typing import cast
 from typing import Tuple
 from urllib.parse import urljoin
 from urllib.parse import urlparse
 
-import bs4
 import requests
 from bs4 import BeautifulSoup
 from oauthlib.oauth2 import BackendApplicationClient
@@ -29,8 +29,23 @@ from danswer.connectors.interfaces import LoadConnector
 from danswer.connectors.models import Document
 from danswer.connectors.models import Section
 from danswer.utils.logger import setup_logger
+from danswer.utils.text_processing import format_document_soup
 
 logger = setup_logger()
+
+
+MINTLIFY_UNWANTED = ["sticky", "hidden"]
+
+
+class WEB_CONNECTOR_VALID_SETTINGS(str, Enum):
+    # Given a base site, index everything under that path
+    RECURSIVE = "recursive"
+    # Given a URL, index only the given page
+    SINGLE = "single"
+    # Given a sitemap.xml URL, parse all the pages in it
+    SITEMAP = "sitemap"
+    # Given a file upload where every line is a URL, parse all the URLs provided
+    UPLOAD = "upload"
 
 
 def is_valid_url(url: str) -> bool:
@@ -62,62 +77,6 @@ def get_internal_links(
     return internal_links
 
 
-def strip_excessive_newlines_and_spaces(document: str) -> str:
-    # collapse repeated spaces into one
-    document = re.sub(r" +", " ", document)
-    # remove trailing spaces
-    document = re.sub(r" +[\n\r]", "\n", document)
-    # remove repeated newlines
-    document = re.sub(r"[\n\r]+", "\n", document)
-    return document.strip()
-
-
-def strip_newlines(document: str) -> str:
-    # HTML might contain newlines which are just whitespaces to a browser
-    return re.sub(r"[\n\r]+", " ", document)
-
-
-def format_document(document: BeautifulSoup) -> str:
-    """Format html to a flat text document.
-
-    The following goals:
-    - Newlines from within the HTML are removed (as browser would ignore them as well).
-    - Repeated newlines/spaces are removed (as browsers would ignore them).
-    - Newlines only before and after headlines and paragraphs or when explicit (br or pre tag)
-    - Table columns/rows are separated by newline
-    - List elements are separated by newline and start with a hyphen
-    """
-    text = ""
-    list_element_start = False
-    verbatim_output = 0
-    for e in document.descendants:
-        verbatim_output -= 1
-        if isinstance(e, bs4.element.NavigableString):
-            if isinstance(e, (bs4.element.Comment, bs4.element.Doctype)):
-                continue
-            element_text = e.text
-            if element_text:
-                if verbatim_output > 0:
-                    text += element_text
-                else:
-                    text += strip_newlines(element_text)
-                list_element_start = False
-        elif isinstance(e, bs4.element.Tag):
-            if e.name in ["p", "div"]:
-                if not list_element_start:
-                    text += "\n"
-            elif e.name in ["br", "h1", "h2", "h3", "h4", "tr", "th", "td"]:
-                text += "\n"
-                list_element_start = False
-            elif e.name == "li":
-                text += "\n- "
-                list_element_start = True
-            elif e.name == "pre":
-                if verbatim_output <= 0:
-                    verbatim_output = len(list(e.childGenerator()))
-    return strip_excessive_newlines_and_spaces(text)
-
-
 def start_playwright() -> Tuple[Playwright, BrowserContext]:
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=True)
@@ -143,16 +102,58 @@ def start_playwright() -> Tuple[Playwright, BrowserContext]:
     return playwright, context
 
 
+def extract_urls_from_sitemap(sitemap_url: str) -> list[str]:
+    response = requests.get(sitemap_url)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.content, "html.parser")
+    urls = [loc_tag.text for loc_tag in soup.find_all("loc")]
+
+    return urls
+
+
+def _ensure_valid_url(url: str) -> str:
+    if "://" not in url:
+        return "https://" + url
+    return url
+
+
+def _read_urls_file(location: str) -> list[str]:
+    with open(location, "r") as f:
+        urls = [_ensure_valid_url(line.strip()) for line in f if line.strip()]
+    return urls
+
+
 class WebConnector(LoadConnector):
     def __init__(
         self,
-        base_url: str,
+        base_url: str,  # Can't change this without disrupting existing users
+        web_connector_type: str = WEB_CONNECTOR_VALID_SETTINGS.RECURSIVE.value,
+        mintlify_cleanup: bool = True,  # Mostly ok to apply to other websites as well
         batch_size: int = INDEX_BATCH_SIZE,
     ) -> None:
-        if "://" not in base_url:
-            base_url = "https://" + base_url
-        self.base_url = base_url
+        self.mintlify_cleanup = mintlify_cleanup
         self.batch_size = batch_size
+        self.recursive = False
+
+        if web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.RECURSIVE.value:
+            self.recursive = True
+            self.to_visit_list = [_ensure_valid_url(base_url)]
+            return
+
+        elif web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.SINGLE.value:
+            self.to_visit_list = [_ensure_valid_url(base_url)]
+
+        elif web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.SITEMAP:
+            self.to_visit_list = extract_urls_from_sitemap(_ensure_valid_url(base_url))
+
+        elif web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.UPLOAD:
+            self.to_visit_list = _read_urls_file(base_url)
+
+        else:
+            raise ValueError(
+                "Invalid Web Connector Config, must choose a valid type between: " ""
+            )
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
         if credentials:
@@ -163,7 +164,8 @@ class WebConnector(LoadConnector):
         """Traverses through all pages found on the website
         and converts them into documents"""
         visited_links: set[str] = set()
-        to_visit: list[str] = [self.base_url]
+        to_visit: list[str] = self.to_visit_list
+        base_url = to_visit[0]  # For the recursive case
         doc_batch: list[Document] = []
 
         playwright, context = start_playwright()
@@ -209,17 +211,18 @@ class WebConnector(LoadConnector):
                     logger.info(f"Redirected to {final_page}")
                     current_url = final_page
                     if current_url in visited_links:
-                        logger.info(f"Redirected page already indexed")
+                        logger.info("Redirected page already indexed")
                         continue
                     visited_links.add(current_url)
 
                 content = page.content()
                 soup = BeautifulSoup(content, "html.parser")
 
-                internal_links = get_internal_links(self.base_url, current_url, soup)
-                for link in internal_links:
-                    if link not in visited_links:
-                        to_visit.append(link)
+                if self.recursive:
+                    internal_links = get_internal_links(base_url, current_url, soup)
+                    for link in internal_links:
+                        if link not in visited_links:
+                            to_visit.append(link)
 
                 title_tag = soup.find("title")
                 title = None
@@ -228,7 +231,10 @@ class WebConnector(LoadConnector):
                     title_tag.extract()
 
                 # Heuristics based cleaning of elements based on css classes
-                for undesired_element in WEB_CONNECTOR_IGNORED_CLASSES:
+                unwanted_classes = copy(WEB_CONNECTOR_IGNORED_CLASSES)
+                if self.mintlify_cleanup:
+                    unwanted_classes.extend(MINTLIFY_UNWANTED)
+                for undesired_element in unwanted_classes:
                     [
                         tag.extract()
                         for tag in soup.find_all(
@@ -239,7 +245,8 @@ class WebConnector(LoadConnector):
                 for undesired_tag in WEB_CONNECTOR_IGNORED_ELEMENTS:
                     [tag.extract() for tag in soup.find_all(undesired_tag)]
 
-                page_text = format_document(soup)
+                # 200B is ZeroWidthSpace which we don't care for
+                page_text = format_document_soup(soup).replace("\u200B", "")
 
                 doc_batch.append(
                     Document(
@@ -267,3 +274,9 @@ class WebConnector(LoadConnector):
         if doc_batch:
             playwright.stop()
             yield doc_batch
+
+
+if __name__ == "__main__":
+    connector = WebConnector("https://docs.danswer.dev/")
+    document_batches = connector.load_from_state()
+    print(next(document_batches))

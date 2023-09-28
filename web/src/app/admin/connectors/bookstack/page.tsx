@@ -8,16 +8,17 @@ import { CredentialForm } from "@/components/admin/connectors/CredentialForm";
 import {
   BookstackCredentialJson,
   BookstackConfig,
-  Credential,
   ConnectorIndexingStatus,
+  Credential,
 } from "@/lib/types";
 import useSWR, { useSWRConfig } from "swr";
 import { fetcher } from "@/lib/fetcher";
 import { LoadingAnimation } from "@/components/Loading";
-import { deleteCredential, linkCredential } from "@/lib/credential";
+import { adminDeleteCredential, linkCredential } from "@/lib/credential";
 import { ConnectorForm } from "@/components/admin/connectors/ConnectorForm";
 import { ConnectorsTable } from "@/components/admin/connectors/table/ConnectorsTable";
 import { usePopup } from "@/components/admin/connectors/Popup";
+import { usePublicCredentials } from "@/lib/hooks";
 
 const Main = () => {
   const { popup, setPopup } = usePopup();
@@ -35,10 +36,8 @@ const Main = () => {
     data: credentialsData,
     isLoading: isCredentialsLoading,
     error: isCredentialsError,
-  } = useSWR<Credential<BookstackCredentialJson>[]>(
-    "/api/manage/credential",
-    fetcher
-  );
+    refreshCredentials,
+  } = usePublicCredentials();
 
   if (
     (!connectorIndexingStatuses && isConnectorIndexingStatusesLoading) ||
@@ -62,9 +61,10 @@ const Main = () => {
     (connectorIndexingStatus) =>
       connectorIndexingStatus.connector.source === "bookstack"
   );
-  const bookstackCredential = credentialsData.filter(
-    (credential) => credential.credential_json?.bookstack_api_token_id
-  )[0];
+  const bookstackCredential: Credential<BookstackCredentialJson> | undefined =
+    credentialsData.find(
+      (credential) => credential.credential_json?.bookstack_api_token_id
+    );
 
   return (
     <>
@@ -91,8 +91,8 @@ const Main = () => {
                   });
                   return;
                 }
-                await deleteCredential(bookstackCredential.id);
-                mutate("/api/manage/credential");
+                await adminDeleteCredential(bookstackCredential.id);
+                refreshCredentials();
               }}
             >
               <TrashIcon />
@@ -146,7 +146,7 @@ const Main = () => {
               }}
               onSubmit={(isSuccess) => {
                 if (isSuccess) {
-                  mutate("/api/manage/credential");
+                  refreshCredentials();
                   mutate("/api/manage/admin/connector/indexing-status");
                 }
               }}
@@ -200,21 +200,14 @@ const Main = () => {
               </p>
               <ConnectorForm<BookstackConfig>
                 nameBuilder={(values) => `BookStackConnector`}
+                ccPairNameBuilder={(values) => `BookStackConnector`}
                 source="bookstack"
                 inputType="poll"
                 formBody={<></>}
                 validationSchema={Yup.object().shape({})}
                 initialValues={{}}
                 refreshFreq={10 * 60} // 10 minutes
-                onSubmit={async (isSuccess, responseJson) => {
-                  if (isSuccess && responseJson) {
-                    await linkCredential(
-                      responseJson.id,
-                      bookstackCredential.id
-                    );
-                    mutate("/api/manage/admin/connector/indexing-status");
-                  }
-                }}
+                credentialId={bookstackCredential.id}
               />
             </div>
           </>

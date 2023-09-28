@@ -1,25 +1,34 @@
-export async function deleteCredential<T>(credentialId: number) {
-  const response = await fetch(`/api/manage/credential/${credentialId}`, {
+export async function adminDeleteCredential<T>(credentialId: number) {
+  return await fetch(`/api/manage/admin/credential/${credentialId}`, {
     method: "DELETE",
     headers: {
       "Content-Type": "application/json",
     },
   });
-  return response.json();
 }
 
-export async function linkCredential(
+export async function deleteCredential<T>(credentialId: number) {
+  return await fetch(`/api/manage/credential/${credentialId}`, {
+    method: "DELETE",
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+export function linkCredential(
   connectorId: number,
-  credentialId: number
+  credentialId: number,
+  name?: string
 ) {
-  const response = await fetch(
+  return fetch(
     `/api/manage/connector/${connectorId}/credential/${credentialId}`,
     {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
       },
+      body: JSON.stringify({ name: name || null }),
     }
   );
-  return response.json();
 }

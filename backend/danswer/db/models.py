@@ -2,7 +2,8 @@ import datetime
 from enum import Enum as PyEnum
 from typing import Any
 from typing import List
-from typing import Optional
+from typing import NotRequired
+from typing import TypedDict
 from uuid import UUID
 
 from fastapi_users.db import SQLAlchemyBaseOAuthAccountTableUUID
@@ -13,7 +14,9 @@ from sqlalchemy import DateTime
 from sqlalchemy import Enum
 from sqlalchemy import ForeignKey
 from sqlalchemy import func
+from sqlalchemy import Index
 from sqlalchemy import Integer
+from sqlalchemy import Sequence
 from sqlalchemy import String
 from sqlalchemy import Text
 from sqlalchemy.dialects import postgresql
@@ -23,9 +26,13 @@ from sqlalchemy.orm import mapped_column
 from sqlalchemy.orm import relationship
 
 from danswer.auth.schemas import UserRole
+from danswer.configs.constants import DEFAULT_BOOST
 from danswer.configs.constants import DocumentSource
+from danswer.configs.constants import MessageType
+from danswer.configs.constants import QAFeedbackType
+from danswer.configs.constants import SearchFeedbackType
 from danswer.connectors.models import InputType
-from danswer.datastores.interfaces import StoreType
+from danswer.search.models import SearchType
 
 
 class IndexingStatus(str, PyEnum):
@@ -49,7 +56,7 @@ class Base(DeclarativeBase):
 
 class OAuthAccount(SQLAlchemyBaseOAuthAccountTableUUID, Base):
     # even an almost empty token from keycloak will not fit the default 1024 bytes
-    access_token: Mapped[str] = mapped_column(Text(), nullable=False)  # type: ignore
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)  # type: ignore
 
 
 class User(SQLAlchemyBaseUserTableUUID, Base):
@@ -62,10 +69,53 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
     credentials: Mapped[List["Credential"]] = relationship(
         "Credential", back_populates="user", lazy="joined"
     )
+    query_events: Mapped[List["QueryEvent"]] = relationship(
+        "QueryEvent", back_populates="user"
+    )
+    chat_sessions: Mapped[List["ChatSession"]] = relationship(
+        "ChatSession", back_populates="user"
+    )
 
 
 class AccessToken(SQLAlchemyBaseAccessTokenTableUUID, Base):
     pass
+
+
+"""
+Association tables
+NOTE: must be at the top since they are referenced by other tables
+"""
+
+
+class Persona__DocumentSet(Base):
+    __tablename__ = "persona__document_set"
+
+    persona_id: Mapped[int] = mapped_column(ForeignKey("persona.id"), primary_key=True)
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id"), primary_key=True
+    )
+
+
+class DocumentSet__ConnectorCredentialPair(Base):
+    __tablename__ = "document_set__connector_credential_pair"
+
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id"), primary_key=True
+    )
+    connector_credential_pair_id: Mapped[int] = mapped_column(
+        ForeignKey("connector_credential_pair.id"), primary_key=True
+    )
+    # if `True`, then is part of the current state of the document set
+    # if `False`, then is a part of the prior state of the document set
+    # rows with `is_current=False` should be deleted when the document
+    # set is updated and should not exist for a given document set if
+    # `DocumentSet.is_up_to_date == True`
+    is_current: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        primary_key=True,
+    )
 
 
 class ConnectorCredentialPair(Base):
@@ -75,6 +125,17 @@ class ConnectorCredentialPair(Base):
     """
 
     __tablename__ = "connector_credential_pair"
+    # NOTE: this `id` column has to use `Sequence` instead of `autoincrement=True`
+    # due to some SQLAlchemy quirks + this not being a primary key column
+    id: Mapped[int] = mapped_column(
+        Integer,
+        Sequence("connector_credential_pair_id_seq"),
+        unique=True,
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(
+        String, unique=True, nullable=True
+    )  # nullable for backwards compatability
     connector_id: Mapped[int] = mapped_column(
         ForeignKey("connector.id"), primary_key=True
     )
@@ -95,6 +156,11 @@ class ConnectorCredentialPair(Base):
     )
     credential: Mapped["Credential"] = relationship(
         "Credential", back_populates="connectors"
+    )
+    document_sets: Mapped[List["DocumentSet"]] = relationship(
+        "DocumentSet",
+        secondary=DocumentSet__ConnectorCredentialPair.__table__,
+        back_populates="connector_credential_pairs",
     )
 
 
@@ -130,9 +196,6 @@ class Connector(Base):
     index_attempts: Mapped[List["IndexAttempt"]] = relationship(
         "IndexAttempt", back_populates="connector"
     )
-    deletion_attempt: Mapped[Optional["DeletionAttempt"]] = relationship(
-        "DeletionAttempt", back_populates="connector"
-    )
 
 
 class Credential(Base):
@@ -160,10 +223,7 @@ class Credential(Base):
     index_attempts: Mapped[List["IndexAttempt"]] = relationship(
         "IndexAttempt", back_populates="credential"
     )
-    deletion_attempt: Mapped[Optional["DeletionAttempt"]] = relationship(
-        "DeletionAttempt", back_populates="credential"
-    )
-    user: Mapped[User] = relationship("User", back_populates="credentials")
+    user: Mapped[User | None] = relationship("User", back_populates="credentials")
 
 
 class IndexAttempt(Base):
@@ -185,9 +245,9 @@ class IndexAttempt(Base):
         nullable=True,
     )
     status: Mapped[IndexingStatus] = mapped_column(Enum(IndexingStatus))
-    num_docs_indexed: Mapped[int] = mapped_column(Integer, default=0)
+    num_docs_indexed: Mapped[int | None] = mapped_column(Integer, default=0)
     error_msg: Mapped[str | None] = mapped_column(
-        String(), default=None
+        Text, default=None
     )  # only filled if status = "failed"
     time_created: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
@@ -195,7 +255,7 @@ class IndexAttempt(Base):
     )
     # when the actual indexing run began
     # NOTE: will use the api_server clock rather than DB server clock
-    time_started: Mapped[datetime.datetime] = mapped_column(
+    time_started: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
     time_updated: Mapped[datetime.datetime] = mapped_column(
@@ -211,6 +271,15 @@ class IndexAttempt(Base):
         "Credential", back_populates="index_attempts"
     )
 
+    __table_args__ = (
+        Index(
+            "ix_index_attempt_latest_for_connector_credential_pair",
+            "connector_id",
+            "credential_id",
+            "time_created",
+        ),
+    )
+
     def __repr__(self) -> str:
         return (
             f"<IndexAttempt(id={self.id!r}, "
@@ -222,61 +291,6 @@ class IndexAttempt(Base):
         )
 
 
-class DeletionAttempt(Base):
-    """Represents an attempt to delete all documents indexed by a specific
-    connector / credential pair.
-    """
-
-    __tablename__ = "deletion_attempt"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    connector_id: Mapped[int] = mapped_column(
-        ForeignKey("connector.id"),
-    )
-    credential_id: Mapped[int] = mapped_column(
-        ForeignKey("credential.id"),
-    )
-    status: Mapped[DeletionStatus] = mapped_column(Enum(DeletionStatus))
-    num_docs_deleted: Mapped[int] = mapped_column(Integer, default=0)
-    error_msg: Mapped[str | None] = mapped_column(
-        String(), default=None
-    )  # only filled if status = "failed"
-    time_created: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-    )
-    time_updated: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-
-    connector: Mapped[Connector] = relationship(
-        "Connector", back_populates="deletion_attempt"
-    )
-    credential: Mapped[Credential] = relationship(
-        "Credential", back_populates="deletion_attempt"
-    )
-
-
-class Document(Base):
-    """Represents a single documents from a source. This is used to store
-    document level metadata so we don't need to duplicate it in a bunch of
-    DocumentByConnectorCredentialPair's/Chunk's for documents
-    that are split into many chunks and/or indexed by many connector / credential
-    pairs."""
-
-    __tablename__ = "document"
-
-    # this should correspond to the ID of the document (as is passed around
-    # in Danswer)
-    id: Mapped[str] = mapped_column(String, primary_key=True)
-
-    document_store_entries: Mapped["Chunk"] = relationship(
-        "Chunk", back_populates="document"
-    )
-
-
 class DocumentByConnectorCredentialPair(Base):
     """Represents an indexing of a document by a specific connector / credential
     pair"""
@@ -284,6 +298,7 @@ class DocumentByConnectorCredentialPair(Base):
     __tablename__ = "document_by_connector_credential_pair"
 
     id: Mapped[str] = mapped_column(ForeignKey("document.id"), primary_key=True)
+    # TODO: transition this to use the ConnectorCredentialPair id directly
     connector_id: Mapped[int] = mapped_column(
         ForeignKey("connector.id"), primary_key=True
     )
@@ -299,19 +314,188 @@ class DocumentByConnectorCredentialPair(Base):
     )
 
 
-class Chunk(Base):
-    """A row represents a single entry in a document store (e.g. a single chunk
-    in Qdrant/Typesense)"""
+class QueryEvent(Base):
+    __tablename__ = "query_event"
 
-    __tablename__ = "chunk"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    query: Mapped[str] = mapped_column(Text)
+    # search_flow refers to user selection, None if user used auto
+    selected_search_flow: Mapped[SearchType | None] = mapped_column(
+        Enum(SearchType), nullable=True
+    )
+    llm_answer: Mapped[str | None] = mapped_column(Text, default=None)
+    feedback: Mapped[QAFeedbackType | None] = mapped_column(
+        Enum(QAFeedbackType), nullable=True
+    )
+    user_id: Mapped[UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+    time_created: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
 
-    # this should correspond to the ID in the document store
+    user: Mapped[User | None] = relationship("User", back_populates="query_events")
+    document_feedbacks: Mapped[List["DocumentRetrievalFeedback"]] = relationship(
+        "DocumentRetrievalFeedback", back_populates="qa_event"
+    )
+
+
+class DocumentRetrievalFeedback(Base):
+    __tablename__ = "document_retrieval_feedback"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    qa_event_id: Mapped[int] = mapped_column(
+        ForeignKey("query_event.id"),
+    )
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("document.id"),
+    )
+    # How high up this document is in the results, 1 for first
+    document_rank: Mapped[int] = mapped_column(Integer)
+    clicked: Mapped[bool] = mapped_column(Boolean, default=False)
+    feedback: Mapped[SearchFeedbackType | None] = mapped_column(
+        Enum(SearchFeedbackType), nullable=True
+    )
+
+    qa_event: Mapped[QueryEvent] = relationship(
+        "QueryEvent", back_populates="document_feedbacks"
+    )
+    document: Mapped["Document"] = relationship(
+        "Document", back_populates="retrieval_feedbacks"
+    )
+
+
+class Document(Base):
+    __tablename__ = "document"
+
+    # this should correspond to the ID of the document
+    # (as is passed around in Danswer)
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    document_store_type: Mapped[StoreType] = mapped_column(
-        Enum(StoreType), primary_key=True
-    )
-    document_id: Mapped[str] = mapped_column(ForeignKey("document.id"))
+    # 0 for neutral, positive for mostly endorse, negative for mostly reject
+    boost: Mapped[int] = mapped_column(Integer, default=DEFAULT_BOOST)
+    hidden: Mapped[bool] = mapped_column(Boolean, default=False)
+    semantic_id: Mapped[str] = mapped_column(String)
+    # First Section's link
+    link: Mapped[str | None] = mapped_column(String, nullable=True)
+    # TODO if more sensitive data is added here for display, make sure to add user/group permission
 
-    document: Mapped[Document] = relationship(
-        "Document", back_populates="document_store_entries"
+    retrieval_feedbacks: Mapped[List[DocumentRetrievalFeedback]] = relationship(
+        "DocumentRetrievalFeedback", back_populates="document"
     )
+
+
+class DocumentSet(Base):
+    __tablename__ = "document_set"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, unique=True)
+    description: Mapped[str] = mapped_column(String)
+    user_id: Mapped[UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+    # whether or not changes to the document set have been propogated
+    is_up_to_date: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    connector_credential_pairs: Mapped[list[ConnectorCredentialPair]] = relationship(
+        "ConnectorCredentialPair",
+        secondary=DocumentSet__ConnectorCredentialPair.__table__,
+        back_populates="document_sets",
+    )
+    personas: Mapped[list["Persona"]] = relationship(
+        "Persona",
+        secondary=Persona__DocumentSet.__table__,
+        back_populates="document_sets",
+    )
+
+
+class ChatSession(Base):
+    __tablename__ = "chat_session"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+    description: Mapped[str] = mapped_column(Text)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The following texts help build up the model's ability to use the context effectively
+    time_updated: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    time_created: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    user: Mapped[User] = relationship("User", back_populates="chat_sessions")
+    messages: Mapped[List["ChatMessage"]] = relationship(
+        "ChatMessage", back_populates="chat_session", cascade="delete"
+    )
+
+
+class Persona(Base):
+    # TODO introduce user and group ownership for personas
+    __tablename__ = "persona"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    # Danswer retrieval, treated as a special tool
+    retrieval_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    system_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tools_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hint_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Default personas are configured via backend during deployment
+    # Treated specially (cannot be user edited etc.)
+    default_persona: Mapped[bool] = mapped_column(Boolean, default=False)
+    # If it's updated and no longer latest (should no longer be shown), it is also considered deleted
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    document_sets: Mapped[list[DocumentSet]] = relationship(
+        "DocumentSet",
+        secondary=Persona__DocumentSet.__table__,
+        back_populates="personas",
+    )
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_message"
+
+    chat_session_id: Mapped[int] = mapped_column(
+        ForeignKey("chat_session.id"), primary_key=True
+    )
+    message_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+    edit_number: Mapped[int] = mapped_column(Integer, default=0, primary_key=True)
+    parent_edit_number: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # null if first message
+    latest: Mapped[bool] = mapped_column(Boolean, default=True)
+    message: Mapped[str] = mapped_column(Text)
+    token_count: Mapped[int] = mapped_column(Integer)
+    message_type: Mapped[MessageType] = mapped_column(Enum(MessageType))
+    persona_id: Mapped[int | None] = mapped_column(
+        ForeignKey("persona.id"), nullable=True
+    )
+    time_sent: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    chat_session: Mapped[ChatSession] = relationship("ChatSession")
+    persona: Mapped[Persona | None] = relationship("Persona")
+
+
+class ChannelConfig(TypedDict):
+    """NOTE: is a `TypedDict` so it can be used a type hint for a JSONB column
+    in Postgres"""
+
+    channel_names: list[str]
+    answer_validity_check_enabled: NotRequired[bool]  # not specified => False
+    team_members: NotRequired[list[str]]
+
+
+class SlackBotConfig(Base):
+    __tablename__ = "slack_bot_config"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    persona_id: Mapped[int | None] = mapped_column(
+        ForeignKey("persona.id"), nullable=True
+    )
+    # JSON for flexibility. Contains things like: channel name, team members, etc.
+    channel_config: Mapped[ChannelConfig] = mapped_column(
+        postgresql.JSONB(), nullable=False
+    )
+
+    persona: Mapped[Persona | None] = relationship("Persona")

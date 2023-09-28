@@ -2,6 +2,7 @@ import json
 import math
 import re
 from collections.abc import Generator
+from collections.abc import Iterator
 from typing import cast
 from typing import Optional
 from typing import Tuple
@@ -9,6 +10,7 @@ from typing import Tuple
 import regex
 
 from danswer.chunking.models import InferenceChunk
+from danswer.configs.app_configs import NUM_DOCUMENT_TOKENS_FED_TO_GENERATIVE_MODEL
 from danswer.configs.app_configs import QUOTE_ALLOWED_ERROR_PERCENT
 from danswer.configs.constants import GEN_AI_API_KEY_STORAGE_KEY
 from danswer.configs.model_configs import GEN_AI_API_KEY
@@ -20,8 +22,10 @@ from danswer.direct_qa.qa_prompts import ANSWER_PAT
 from danswer.direct_qa.qa_prompts import QUOTE_PAT
 from danswer.direct_qa.qa_prompts import UNCERTAINTY_PAT
 from danswer.dynamic_configs import get_dynamic_config_store
+from danswer.llm.utils import check_number_of_tokens
 from danswer.utils.logger import setup_logger
 from danswer.utils.text_processing import clean_model_quote
+from danswer.utils.text_processing import clean_up_code_blocks
 from danswer.utils.text_processing import shared_precompare_cleanup
 
 logger = setup_logger()
@@ -77,12 +81,15 @@ def extract_answer_quotes_json(
 
 
 def separate_answer_quotes(
-    answer_raw: str,
+    answer_raw: str, is_json_prompt: bool = False
 ) -> Tuple[Optional[str], Optional[list[str]]]:
     try:
         model_raw_json = json.loads(answer_raw)
         return extract_answer_quotes_json(model_raw_json)
     except ValueError:
+        if is_json_prompt:
+            logger.error("Model did not output in json format as expected.")
+            raise
         return extract_answer_quotes_freeform(answer_raw)
 
 
@@ -146,9 +153,13 @@ def match_quotes_to_docs(
 
 
 def process_answer(
-    answer_raw: str, chunks: list[InferenceChunk]
+    answer_raw: str,
+    chunks: list[InferenceChunk],
+    is_json_prompt: bool = True,
 ) -> tuple[DanswerAnswer, DanswerQuotes]:
-    answer, quote_strings = separate_answer_quotes(answer_raw)
+    answer_clean = clean_up_code_blocks(answer_raw)
+
+    answer, quote_strings = separate_answer_quotes(answer_clean, is_json_prompt)
     if answer == UNCERTAINTY_PAT or not answer:
         if answer == UNCERTAINTY_PAT:
             logger.debug("Answer matched UNCERTAINTY_PAT")
@@ -191,7 +202,7 @@ def extract_quotes_from_completed_token_stream(
 
 
 def process_model_tokens(
-    tokens: Generator[str, None, None],
+    tokens: Iterator[str],
     context_docs: list[InferenceChunk],
     is_json_prompt: bool = True,
 ) -> Generator[DanswerAnswerPiece | DanswerQuotes, None, None]:
@@ -211,12 +222,17 @@ def process_model_tokens(
         model_previous = model_output
         model_output += token
 
-        trimmed_combine = model_output.replace(" ", "").replace("\n", "")
-        if not found_answer_start and '{"answer":"' in trimmed_combine:
+        if not found_answer_start and '{"answer":"' in re.sub(r"\s", "", model_output):
             # Note, if the token that completes the pattern has additional text, for example if the token is "?
             # Then the chars after " will not be streamed, but this is ok as it prevents streaming the ? in the
             # event that the model outputs the UNCERTAINTY_PAT
             found_answer_start = True
+
+            # Prevent heavy cases of hallucinations where model is not even providing a json until later
+            if is_json_prompt and len(model_output) > 20:
+                logger.warning("LLM did not produce json as prompted")
+                found_answer_end = True
+
             continue
 
         if found_answer_start and not found_answer_end:
@@ -232,7 +248,7 @@ def process_model_tokens(
                 if hold_quote + token in quote_pat_full:
                     hold_quote += token
                     continue
-            yield DanswerAnswerPiece(answer_piece=token)
+            yield DanswerAnswerPiece(answer_piece=hold_quote + token)
             hold_quote = ""
 
     logger.debug(f"Raw model output: {model_output}")
@@ -244,6 +260,9 @@ def process_model_tokens(
             json_answer_ind = model_output.index('{"answer":')
             if json_answer_ind != 0:
                 model_output = model_output[json_answer_ind:]
+            end = model_output.rfind("}")
+            if end != -1:
+                model_output = model_output[: end + 1]
         except ValueError:
             logger.exception("Did not find answer pattern in response for JSON prompt")
 
@@ -254,3 +273,48 @@ def simulate_streaming_response(model_out: str) -> Generator[str, None, None]:
     """Mock streaming by generating the passed in model output, character by character"""
     for token in model_out:
         yield token
+
+
+def _get_usable_chunks(
+    chunks: list[InferenceChunk], token_limit: int
+) -> list[InferenceChunk]:
+    total_token_count = 0
+    usable_chunks = []
+    for chunk in chunks:
+        chunk_token_count = check_number_of_tokens(chunk.content)
+        if total_token_count + chunk_token_count > token_limit:
+            break
+
+        total_token_count += chunk_token_count
+        usable_chunks.append(chunk)
+
+    # try and return at least one chunk if possible. This chunk will
+    # get truncated later on in the pipeline. This would only occur if
+    # the first chunk is larger than the token limit (usually due to character
+    # count -> token count mismatches caused by special characters / non-ascii
+    # languages)
+    if not usable_chunks and chunks:
+        usable_chunks = [chunks[0]]
+
+    return usable_chunks
+
+
+def get_usable_chunks(
+    chunks: list[InferenceChunk],
+    token_limit: int = NUM_DOCUMENT_TOKENS_FED_TO_GENERATIVE_MODEL,
+    offset: int = 0,
+) -> list[InferenceChunk]:
+    offset_into_chunks = 0
+    usable_chunks: list[InferenceChunk] = []
+    for _ in range(min(offset + 1, 1)):  # go through this process at least once
+        if offset_into_chunks >= len(chunks) and offset_into_chunks > 0:
+            raise ValueError(
+                "Chunks offset too large, should not retry this many times"
+            )
+
+        usable_chunks = _get_usable_chunks(
+            chunks=chunks[offset_into_chunks:], token_limit=token_limit
+        )
+        offset_into_chunks += len(usable_chunks)
+
+    return usable_chunks

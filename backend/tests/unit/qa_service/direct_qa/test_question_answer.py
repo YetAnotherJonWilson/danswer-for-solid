@@ -112,7 +112,10 @@ class TestQAPostprocessing(unittest.TestCase):
             blurb="anything",
             semantic_identifier="anything",
             section_continuation=False,
+            boost=0,
+            score=1,
             metadata={},
+            match_highlights=[],
         )
         test_chunk_1 = InferenceChunk(
             document_id="test doc 1",
@@ -123,7 +126,10 @@ class TestQAPostprocessing(unittest.TestCase):
             blurb="whatever",
             semantic_identifier="whatever",
             section_continuation=False,
+            boost=0,
+            score=1,
             metadata={},
+            match_highlights=[],
         )
 
         test_quotes = [

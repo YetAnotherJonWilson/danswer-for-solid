@@ -14,10 +14,23 @@ import {
 import useSWR, { useSWRConfig } from "swr";
 import { fetcher } from "@/lib/fetcher";
 import { LoadingAnimation } from "@/components/Loading";
-import { deleteCredential, linkCredential } from "@/lib/credential";
+import { adminDeleteCredential, linkCredential } from "@/lib/credential";
 import { ConnectorForm } from "@/components/admin/connectors/ConnectorForm";
 import { ConnectorsTable } from "@/components/admin/connectors/table/ConnectorsTable";
 import { usePopup } from "@/components/admin/connectors/Popup";
+import { usePublicCredentials } from "@/lib/hooks";
+
+// Copied from the `extract_jira_project` function
+const extractJiraProject = (url: string): string | null => {
+  const parsedUrl = new URL(url);
+  const splitPath = parsedUrl.pathname.split("/");
+  const projectPos = splitPath.indexOf("projects");
+  if (projectPos !== -1 && splitPath.length > projectPos + 1) {
+    const jiraProject = splitPath[projectPos + 1];
+    return jiraProject;
+  }
+  return null;
+};
 
 const Main = () => {
   const { popup, setPopup } = usePopup();
@@ -34,9 +47,10 @@ const Main = () => {
   const {
     data: credentialsData,
     isLoading: isCredentialsLoading,
-    isValidating: isCredentialsValidating,
     error: isCredentialsError,
-  } = useSWR<Credential<any>[]>("/api/manage/credential", fetcher);
+    isValidating: isCredentialsValidating,
+    refreshCredentials,
+  } = usePublicCredentials();
 
   if (
     isConnectorIndexingStatusesLoading ||
@@ -96,8 +110,20 @@ const Main = () => {
                   });
                   return;
                 }
-                await deleteCredential(jiraCredential.id);
-                mutate("/api/manage/credential");
+                const response = await adminDeleteCredential(jiraCredential.id);
+                if (response.ok) {
+                  setPopup({
+                    type: "success",
+                    message: "Successfully deleted credential!",
+                  });
+                } else {
+                  const errorMsg = await response.text();
+                  setPopup({
+                    type: "error",
+                    message: `Failed to delete credential - ${errorMsg}`,
+                  });
+                }
+                refreshCredentials();
               }}
             >
               <TrashIcon />
@@ -142,7 +168,7 @@ const Main = () => {
               }}
               onSubmit={(isSuccess) => {
                 if (isSuccess) {
-                  mutate("/api/manage/credential");
+                  refreshCredentials();
                 }
               }}
             />
@@ -219,6 +245,10 @@ const Main = () => {
               nameBuilder={(values) =>
                 `JiraConnector-${values.jira_project_url}`
               }
+              ccPairNameBuilder={(values) =>
+                extractJiraProject(values.jira_project_url)
+              }
+              credentialId={jiraCredential.id}
               source="jira"
               inputType="poll"
               formBody={
@@ -238,12 +268,6 @@ const Main = () => {
                 jira_project_url: "",
               }}
               refreshFreq={10 * 60} // 10 minutes
-              onSubmit={async (isSuccess, responseJson) => {
-                if (isSuccess && responseJson) {
-                  await linkCredential(responseJson.id, jiraCredential.id);
-                  mutate("/api/manage/admin/connector/indexing-status");
-                }
-              }}
             />
           </div>
         </>

@@ -17,12 +17,17 @@ from danswer.direct_qa.huggingface import HuggingFaceChatCompletionQA
 from danswer.direct_qa.huggingface import HuggingFaceCompletionQA
 from danswer.direct_qa.interfaces import QAModel
 from danswer.direct_qa.local_transformers import TransformerQA
-from danswer.direct_qa.open_ai import OpenAIChatCompletionQA
 from danswer.direct_qa.open_ai import OpenAICompletionQA
+from danswer.direct_qa.qa_block import QABlock
+from danswer.direct_qa.qa_block import QAHandler
+from danswer.direct_qa.qa_block import SimpleChatQAHandler
+from danswer.direct_qa.qa_block import SingleMessageQAHandler
+from danswer.direct_qa.qa_block import SingleMessageScratchpadHandler
 from danswer.direct_qa.qa_prompts import WeakModelFreeformProcessor
 from danswer.direct_qa.qa_utils import get_gen_ai_api_key
 from danswer.direct_qa.request_model import RequestCompletionQA
 from danswer.dynamic_configs.interface import ConfigNotFoundError
+from danswer.llm.build import get_default_llm
 from danswer.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -32,12 +37,12 @@ def check_model_api_key_is_valid(model_api_key: str) -> bool:
     if not model_api_key:
         return False
 
-    qa_model = get_default_llm(api_key=model_api_key, timeout=5)
+    llm = get_default_llm(api_key=model_api_key, timeout=5)
 
     # try for up to 2 timeouts (e.g. 10 seconds in total)
     for _ in range(2):
         try:
-            qa_model.answer_question("Do not respond", [])
+            llm.invoke("Do not respond")
             return True
         except AuthenticationError:
             return False
@@ -47,12 +52,24 @@ def check_model_api_key_is_valid(model_api_key: str) -> bool:
     return False
 
 
-def get_default_llm(
+def get_default_qa_handler(model: str, real_time_flow: bool = True) -> QAHandler:
+    if model == DanswerGenAIModel.OPENAI_CHAT.value:
+        return (
+            SingleMessageQAHandler()
+            if real_time_flow
+            else SingleMessageScratchpadHandler()
+        )
+
+    return SimpleChatQAHandler()
+
+
+def get_default_qa_model(
     internal_model: str = INTERNAL_MODEL_VERSION,
     endpoint: str | None = GEN_AI_ENDPOINT,
     model_host_type: str | None = GEN_AI_HOST_TYPE,
     api_key: str | None = GEN_AI_API_KEY,
     timeout: int = QA_TIMEOUT,
+    real_time_flow: bool = True,
     **kwargs: Any,
 ) -> QAModel:
     if not api_key:
@@ -60,6 +77,24 @@ def get_default_llm(
             api_key = get_gen_ai_api_key()
         except ConfigNotFoundError:
             pass
+
+    try:
+        # un-used arguments will be ignored by the underlying `LLM` class
+        # if any args are missing, a `TypeError` will be thrown
+        llm = get_default_llm(timeout=timeout)
+        qa_handler = get_default_qa_handler(
+            model=internal_model, real_time_flow=real_time_flow
+        )
+
+        return QABlock(
+            llm=llm,
+            qa_handler=qa_handler,
+        )
+    except Exception:
+        logger.exception(
+            "Unable to build a QABlock with the new approach, going back to the "
+            "legacy approach"
+        )
 
     if internal_model in [
         DanswerGenAIModel.GPT4ALL.value,
@@ -70,8 +105,6 @@ def get_default_llm(
 
     if internal_model == DanswerGenAIModel.OPENAI.value:
         return OpenAICompletionQA(timeout=timeout, api_key=api_key, **kwargs)
-    elif internal_model == DanswerGenAIModel.OPENAI_CHAT.value:
-        return OpenAIChatCompletionQA(timeout=timeout, api_key=api_key, **kwargs)
     elif internal_model == DanswerGenAIModel.GPT4ALL.value:
         return GPT4AllCompletionQA(**kwargs)
     elif internal_model == DanswerGenAIModel.GPT4ALL_CHAT.value:

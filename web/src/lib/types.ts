@@ -29,6 +29,14 @@ export type ValidStatuses =
   | "in_progress"
   | "not_started";
 
+export interface DocumentBoostStatus {
+  document_id: string;
+  semantic_id: string;
+  link: string;
+  boost: number;
+  hidden: boolean;
+}
+
 // CONNECTORS
 export interface ConnectorBase<T> {
   name: string;
@@ -53,6 +61,8 @@ export interface WebConfig {
 export interface GithubConfig {
   repo_owner: string;
   repo_name: string;
+  include_prs: boolean;
+  include_issues: boolean;
 }
 
 export interface GoogleDriveConfig {
@@ -107,6 +117,8 @@ export interface ConnectorIndexingStatus<
   ConnectorConfigType,
   ConnectorCredentialType
 > {
+  cc_pair_id: number;
+  name: string | null;
   connector: Connector<ConnectorConfigType>;
   credential: Credential<ConnectorCredentialType>;
   public_doc: boolean;
@@ -116,7 +128,7 @@ export interface ConnectorIndexingStatus<
   docs_indexed: number;
   error_msg: string;
   latest_index_attempt: IndexAttemptSnapshot | null;
-  deletion_attempts: DeletionAttemptSnapshot[];
+  deletion_attempt: DeletionAttemptSnapshot | null;
   is_deletable: boolean;
 }
 
@@ -165,6 +177,11 @@ export interface GoogleDriveCredentialJson {
   google_drive_tokens: string;
 }
 
+export interface GoogleDriveServiceAccountCredentialJson {
+  google_drive_service_account_key: string;
+  google_drive_delegated_user: string;
+}
+
 export interface SlabCredentialJson {
   slab_bot_token: string;
 }
@@ -190,7 +207,42 @@ export interface LinearCredentialJson {
 
 export interface DeletionAttemptSnapshot {
   connector_id: number;
+  credential_id: number;
   status: ValidStatuses;
   error_msg?: string;
   num_docs_deleted: number;
+}
+
+// DOCUMENT SETS
+export interface CCPairDescriptor<ConnectorType, CredentialType> {
+  id: number;
+  name: string | null;
+  connector: Connector<ConnectorType>;
+  credential: Credential<CredentialType>;
+}
+
+export interface DocumentSet<ConnectorType, CredentialType> {
+  id: number;
+  name: string;
+  description: string;
+  cc_pair_descriptors: CCPairDescriptor<ConnectorType, CredentialType>[];
+  is_up_to_date: boolean;
+}
+
+// SLACK BOT CONFIGS
+export interface ChannelConfig {
+  channel_names: string[];
+  answer_validity_check_enabled?: boolean;
+  team_members?: string[];
+}
+
+export interface SlackBotConfig {
+  id: number;
+  document_sets: DocumentSet<any, any>[];
+  channel_config: ChannelConfig;
+}
+
+export interface SlackBotTokens {
+  bot_token: string;
+  app_token: string;
 }

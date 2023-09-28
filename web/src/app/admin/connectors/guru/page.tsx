@@ -14,10 +14,11 @@ import {
 import useSWR, { useSWRConfig } from "swr";
 import { fetcher } from "@/lib/fetcher";
 import { LoadingAnimation } from "@/components/Loading";
-import { deleteCredential, linkCredential } from "@/lib/credential";
+import { adminDeleteCredential, linkCredential } from "@/lib/credential";
 import { ConnectorForm } from "@/components/admin/connectors/ConnectorForm";
 import { ConnectorsTable } from "@/components/admin/connectors/table/ConnectorsTable";
 import { usePopup } from "@/components/admin/connectors/Popup";
+import { usePublicCredentials } from "@/lib/hooks";
 
 const Main = () => {
   const { popup, setPopup } = usePopup();
@@ -31,12 +32,14 @@ const Main = () => {
     "/api/manage/admin/connector/indexing-status",
     fetcher
   );
+
   const {
     data: credentialsData,
     isLoading: isCredentialsLoading,
     isValidating: isCredentialsValidating,
     error: isCredentialsError,
-  } = useSWR<Credential<any>[]>("/api/manage/credential", fetcher);
+    refreshCredentials,
+  } = usePublicCredentials();
 
   if (
     isConnectorIndexingStatusesLoading ||
@@ -61,9 +64,8 @@ const Main = () => {
     (connectorIndexingStatus) =>
       connectorIndexingStatus.connector.source === "guru"
   );
-  const guruCredential: Credential<GuruCredentialJson> = credentialsData.filter(
-    (credential) => credential.credential_json?.guru_user
-  )[0];
+  const guruCredential: Credential<GuruCredentialJson> | undefined =
+    credentialsData.find((credential) => credential.credential_json?.guru_user);
 
   return (
     <>
@@ -94,8 +96,8 @@ const Main = () => {
                   });
                   return;
                 }
-                await deleteCredential(guruCredential.id);
-                mutate("/api/manage/credential");
+                await adminDeleteCredential(guruCredential.id);
+                refreshCredentials();
               }}
             >
               <TrashIcon />
@@ -141,7 +143,7 @@ const Main = () => {
               }}
               onSubmit={(isSuccess) => {
                 if (isSuccess) {
-                  mutate("/api/manage/credential");
+                  refreshCredentials();
                 }
               }}
             />
@@ -163,18 +165,14 @@ const Main = () => {
             <div className="flex">
               <ConnectorForm<GuruConfig>
                 nameBuilder={() => "GuruConnector"}
+                ccPairNameBuilder={() => "Guru"}
                 source="guru"
                 inputType="poll"
                 formBody={null}
                 validationSchema={Yup.object().shape({})}
                 initialValues={{}}
                 refreshFreq={10 * 60} // 10 minutes
-                onSubmit={async (isSuccess, responseJson) => {
-                  if (isSuccess && responseJson) {
-                    await linkCredential(responseJson.id, guruCredential.id);
-                    mutate("/api/manage/admin/connector/indexing-status");
-                  }
-                }}
+                credentialId={guruCredential.id}
               />
             </div>
           </>

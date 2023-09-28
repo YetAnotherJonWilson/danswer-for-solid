@@ -8,16 +8,28 @@ import { CredentialForm } from "@/components/admin/connectors/CredentialForm";
 import {
   ConfluenceCredentialJson,
   ConfluenceConfig,
-  Credential,
   ConnectorIndexingStatus,
+  Credential,
 } from "@/lib/types";
 import useSWR, { useSWRConfig } from "swr";
 import { fetcher } from "@/lib/fetcher";
 import { LoadingAnimation } from "@/components/Loading";
-import { deleteCredential, linkCredential } from "@/lib/credential";
+import { adminDeleteCredential, linkCredential } from "@/lib/credential";
 import { ConnectorForm } from "@/components/admin/connectors/ConnectorForm";
 import { ConnectorsTable } from "@/components/admin/connectors/table/ConnectorsTable";
 import { usePopup } from "@/components/admin/connectors/Popup";
+import { usePublicCredentials } from "@/lib/hooks";
+
+// Copied from the `extract_confluence_keys_from_url` function
+const extractSpaceFromUrl = (wikiUrl: string): string | null => {
+  if (!wikiUrl.includes(".atlassian.net/wiki/spaces/")) {
+    return null;
+  }
+
+  const parsedUrl = new URL(wikiUrl);
+  const space = parsedUrl.pathname.split("/")[3];
+  return space;
+};
 
 const Main = () => {
   const { popup, setPopup } = usePopup();
@@ -35,10 +47,8 @@ const Main = () => {
     data: credentialsData,
     isLoading: isCredentialsLoading,
     error: isCredentialsError,
-  } = useSWR<Credential<ConfluenceCredentialJson>[]>(
-    "/api/manage/credential",
-    fetcher
-  );
+    refreshCredentials,
+  } = usePublicCredentials();
 
   if (
     (!connectorIndexingStatuses && isConnectorIndexingStatusesLoading) ||
@@ -62,9 +72,10 @@ const Main = () => {
     (connectorIndexingStatus) =>
       connectorIndexingStatus.connector.source === "confluence"
   );
-  const confluenceCredential = credentialsData.filter(
-    (credential) => credential.credential_json?.confluence_access_token
-  )[0];
+  const confluenceCredential: Credential<ConfluenceCredentialJson> | undefined =
+    credentialsData.find(
+      (credential) => credential.credential_json?.confluence_access_token
+    );
 
   return (
     <>
@@ -97,8 +108,8 @@ const Main = () => {
                   });
                   return;
                 }
-                await deleteCredential(confluenceCredential.id);
-                mutate("/api/manage/credential");
+                await adminDeleteCredential(confluenceCredential.id);
+                refreshCredentials();
               }}
             >
               <TrashIcon />
@@ -143,7 +154,7 @@ const Main = () => {
               }}
               onSubmit={(isSuccess) => {
                 if (isSuccess) {
-                  mutate("/api/manage/credential");
+                  refreshCredentials();
                 }
               }}
             />
@@ -228,6 +239,9 @@ const Main = () => {
               nameBuilder={(values) =>
                 `ConfluenceConnector-${values.wiki_page_url}`
               }
+              ccPairNameBuilder={(values) =>
+                extractSpaceFromUrl(values.wiki_page_url)
+              }
               source="confluence"
               inputType="poll"
               formBody={
@@ -244,15 +258,7 @@ const Main = () => {
                 wiki_page_url: "",
               }}
               refreshFreq={10 * 60} // 10 minutes
-              onSubmit={async (isSuccess, responseJson) => {
-                if (isSuccess && responseJson) {
-                  await linkCredential(
-                    responseJson.id,
-                    confluenceCredential.id
-                  );
-                  mutate("/api/manage/admin/connector/indexing-status");
-                }
-              }}
+              credentialId={confluenceCredential.id}
             />
           </div>
         </>

@@ -26,8 +26,10 @@ def get_message_link(
     )  # channel must either be present in the event or passed in
     message_ts = cast(str, event["ts"])
     message_ts_without_dot = message_ts.replace(".", "")
+    thread_ts = cast(str | None, event.get("thread_ts"))
     return (
         f"https://{workspace}.slack.com/archives/{channel_id}/p{message_ts_without_dot}"
+        + (f"?thread_ts={thread_ts}" if thread_ts else "")
     )
 
 
@@ -163,7 +165,7 @@ class UserIdReplacer:
         """Simply replaces all channel mentions with `#<CHANNEL_ID>` in order
         to make a message work as part of a link"""
         # Find user IDs in the message
-        channel_matches = re.findall("<#(.*?)\|(.*?)>", message)
+        channel_matches = re.findall(r"<#(.*?)\|(.*?)>", message)
         for channel_id, channel_name in channel_matches:
             message = message.replace(
                 f"<#{channel_id}|{channel_name}>", f"#{channel_name}"
@@ -179,3 +181,23 @@ class UserIdReplacer:
         message = message.replace("<!here>", "@here")
         message = message.replace("<!everyone>", "@everyone")
         return message
+
+    @staticmethod
+    def replace_links(message: str) -> str:
+        """Replaces slack links e.g. `<URL>` -> `URL` and `<URL|DISPLAY>` -> `DISPLAY`"""
+        # Find user IDs in the message
+        possible_link_matches = re.findall(r"<(.*?)>", message)
+        for possible_link in possible_link_matches:
+            if possible_link[0] not in ["#", "@", "!"]:
+                link_display = (
+                    possible_link
+                    if "|" not in possible_link
+                    else possible_link.split("|")[1]
+                )
+                message = message.replace(f"<{possible_link}>", link_display)
+        return message
+
+    @staticmethod
+    def add_zero_width_whitespace_after_tag(message: str) -> str:
+        """Add a 0 width whitespace after every @"""
+        return message.replace("@", "@\u200B")

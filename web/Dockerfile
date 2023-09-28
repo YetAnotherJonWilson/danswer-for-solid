@@ -1,4 +1,4 @@
-FROM node:18-alpine AS base
+FROM node:20-alpine AS base
 
 # Step 1. Install dependencies only when needed
 FROM base AS deps
@@ -14,9 +14,6 @@ RUN \
   elif [ -f pnpm-lock.yaml ]; then yarn global add pnpm && pnpm i --frozen-lockfile; \
   else echo "Lockfile not found." && exit 1; \
   fi
-# needed for image processing
-RUN npm i sharp 
-
 
 # Step 2. Rebuild the source code only when needed
 FROM base AS builder
@@ -38,6 +35,11 @@ RUN npm run build
 # Step 3. Production image, copy all the files and run next
 FROM base AS runner
 WORKDIR /app
+
+# Remove global node modules, since they are not needed by the actual app
+# (all dependencies are copied over into the `/app` dir itself). These
+# global modules may be outdated and trigger security scans.
+RUN rm -rf /usr/local/lib/node_modules
 
 # Not needed, set by compose 
 # ENV NODE_ENV production  

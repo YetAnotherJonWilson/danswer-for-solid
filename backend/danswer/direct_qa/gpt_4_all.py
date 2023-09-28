@@ -1,4 +1,4 @@
-from collections.abc import Generator
+from collections.abc import Callable
 from typing import Any
 
 from danswer.chunking.models import InferenceChunk
@@ -6,11 +6,8 @@ from danswer.configs.model_configs import GEN_AI_MAX_OUTPUT_TOKENS
 from danswer.configs.model_configs import GEN_AI_MODEL_VERSION
 from danswer.direct_qa.interfaces import AnswerQuestionReturn
 from danswer.direct_qa.interfaces import AnswerQuestionStreamReturn
-from danswer.direct_qa.interfaces import DanswerAnswer
-from danswer.direct_qa.interfaces import DanswerAnswerPiece
-from danswer.direct_qa.interfaces import DanswerQuote
-from danswer.direct_qa.interfaces import DanswerQuotes
 from danswer.direct_qa.interfaces import QAModel
+from danswer.direct_qa.models import LLMMetricsContainer
 from danswer.direct_qa.qa_prompts import ChatPromptProcessor
 from danswer.direct_qa.qa_prompts import NonChatPromptProcessor
 from danswer.direct_qa.qa_prompts import WeakChatModelFreeformProcessor
@@ -88,7 +85,10 @@ class GPT4AllCompletionQA(QAModel):
 
     @log_function_time()
     def answer_question(
-        self, query: str, context_docs: list[InferenceChunk]
+        self,
+        query: str,
+        context_docs: list[InferenceChunk],
+        metrics_callback: Callable[[LLMMetricsContainer], None] | None = None,  # Unused
     ) -> AnswerQuestionReturn:
         filled_prompt = self.prompt_processor.fill_prompt(
             query, context_docs, self.include_metadata
@@ -105,8 +105,7 @@ class GPT4AllCompletionQA(QAModel):
 
         logger.debug(model_output)
 
-        answer, quotes = process_answer(model_output, context_docs)
-        return answer, quotes
+        return process_answer(model_output, context_docs)
 
     def answer_question_stream(
         self, query: str, context_docs: list[InferenceChunk]
@@ -153,7 +152,10 @@ class GPT4AllChatCompletionQA(QAModel):
 
     @log_function_time()
     def answer_question(
-        self, query: str, context_docs: list[InferenceChunk]
+        self,
+        query: str,
+        context_docs: list[InferenceChunk],
+        metrics_callback: Callable[[LLMMetricsContainer], None] | None = None,
     ) -> AnswerQuestionReturn:
         filled_prompt = self.prompt_processor.fill_prompt(
             query, context_docs, self.include_metadata
@@ -176,8 +178,7 @@ class GPT4AllChatCompletionQA(QAModel):
 
         logger.debug(model_output)
 
-        answer, quotes_dict = process_answer(model_output, context_docs)
-        return answer, quotes_dict
+        return process_answer(model_output, context_docs)
 
     def answer_question_stream(
         self, query: str, context_docs: list[InferenceChunk]

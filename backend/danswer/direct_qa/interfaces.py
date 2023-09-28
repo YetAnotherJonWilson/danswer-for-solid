@@ -1,13 +1,22 @@
 import abc
+from collections.abc import Callable
 from collections.abc import Generator
 from dataclasses import dataclass
 
 from danswer.chunking.models import InferenceChunk
+from danswer.direct_qa.models import LLMMetricsContainer
 
 
 @dataclass
 class DanswerAnswer:
     answer: str | None
+
+
+@dataclass
+class DanswerChatModelOut:
+    model_raw: str
+    action: str
+    action_input: str
 
 
 @dataclass
@@ -37,6 +46,7 @@ class DanswerQuotes:
     quotes: list[DanswerQuote]
 
 
+# Final int is for number of output tokens
 AnswerQuestionReturn = tuple[DanswerAnswer, DanswerQuotes]
 AnswerQuestionStreamReturn = Generator[
     DanswerAnswerPiece | DanswerQuotes | None, None, None
@@ -53,13 +63,13 @@ class QAModel:
     def warm_up_model(self) -> None:
         """This is called during server start up to load the models into memory
         pass if model is accessed via API"""
-        pass
 
     @abc.abstractmethod
     def answer_question(
         self,
         query: str,
         context_docs: list[InferenceChunk],
+        metrics_callback: Callable[[LLMMetricsContainer], None] | None = None,
     ) -> AnswerQuestionReturn:
         raise NotImplementedError
 

@@ -3,12 +3,12 @@ from datetime import datetime
 from fastapi import HTTPException
 from sqlalchemy import delete
 from sqlalchemy import select
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from danswer.db.connector import fetch_connector_by_id
 from danswer.db.credentials import fetch_credential_by_id
 from danswer.db.models import ConnectorCredentialPair
-from danswer.db.models import IndexAttempt
 from danswer.db.models import IndexingStatus
 from danswer.db.models import User
 from danswer.server.models import StatusResponse
@@ -22,7 +22,7 @@ def get_connector_credential_pairs(
 ) -> list[ConnectorCredentialPair]:
     stmt = select(ConnectorCredentialPair)
     if not include_disabled:
-        stmt = stmt.where(ConnectorCredentialPair.connector.disabled == False)
+        stmt = stmt.where(ConnectorCredentialPair.connector.disabled == False)  # noqa
     results = db_session.scalars(stmt)
     return list(results.all())
 
@@ -93,9 +93,24 @@ def delete_connector_credential_pair(
     db_session.execute(stmt)
 
 
+def mark_all_in_progress_cc_pairs_failed(
+    db_session: Session,
+) -> None:
+    stmt = (
+        update(ConnectorCredentialPair)
+        .where(
+            ConnectorCredentialPair.last_attempt_status == IndexingStatus.IN_PROGRESS
+        )
+        .values(last_attempt_status=IndexingStatus.FAILED)
+    )
+    db_session.execute(stmt)
+    db_session.commit()
+
+
 def add_credential_to_connector(
     connector_id: int,
     credential_id: int,
+    cc_pair_name: str | None,
     user: User,
     db_session: Session,
 ) -> StatusResponse[int]:
@@ -129,6 +144,7 @@ def add_credential_to_connector(
     association = ConnectorCredentialPair(
         connector_id=connector_id,
         credential_id=credential_id,
+        name=cc_pair_name,
     )
     db_session.add(association)
     db_session.commit()

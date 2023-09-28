@@ -15,8 +15,9 @@ import {
 import { ConnectorForm } from "@/components/admin/connectors/ConnectorForm";
 import { LoadingAnimation } from "@/components/Loading";
 import { CredentialForm } from "@/components/admin/connectors/CredentialForm";
-import { deleteCredential, linkCredential } from "@/lib/credential";
+import { adminDeleteCredential, linkCredential } from "@/lib/credential";
 import { ConnectorsTable } from "@/components/admin/connectors/table/ConnectorsTable";
+import { usePublicCredentials } from "@/lib/hooks";
 
 const Main = () => {
   const { mutate } = useSWRConfig();
@@ -33,10 +34,8 @@ const Main = () => {
     data: credentialsData,
     isLoading: isCredentialsLoading,
     error: isCredentialsError,
-  } = useSWR<Credential<GithubCredentialJson>[]>(
-    "/api/manage/credential",
-    fetcher
-  );
+    refreshCredentials,
+  } = usePublicCredentials();
 
   if (
     (!connectorIndexingStatuses && isConnectorIndexingStatusesLoading) ||
@@ -60,9 +59,10 @@ const Main = () => {
     (connectorIndexingStatus) =>
       connectorIndexingStatus.connector.source === "github"
   );
-  const githubCredential = credentialsData.filter(
-    (credential) => credential.credential_json?.github_access_token
-  )[0];
+  const githubCredential: Credential<GithubCredentialJson> | undefined =
+    credentialsData.find(
+      (credential) => credential.credential_json?.github_access_token
+    );
 
   return (
     <>
@@ -80,8 +80,8 @@ const Main = () => {
             <button
               className="ml-1 hover:bg-gray-700 rounded-full p-1"
               onClick={async () => {
-                await deleteCredential(githubCredential.id);
-                mutate("/api/manage/credential");
+                await adminDeleteCredential(githubCredential.id);
+                refreshCredentials();
               }}
             >
               <TrashIcon />
@@ -121,7 +121,7 @@ const Main = () => {
               }}
               onSubmit={(isSuccess) => {
                 if (isSuccess) {
-                  mutate("/api/manage/credential");
+                  refreshCredentials();
                 }
               }}
             />
@@ -175,6 +175,9 @@ const Main = () => {
             nameBuilder={(values) =>
               `GithubConnector-${values.repo_owner}/${values.repo_name}`
             }
+            ccPairNameBuilder={(values) =>
+              `${values.repo_owner}/${values.repo_name}`
+            }
             source="github"
             inputType="load_state"
             formBody={
@@ -190,18 +193,17 @@ const Main = () => {
               repo_name: Yup.string().required(
                 "Please enter the name of the repository to index e.g. danswer "
               ),
+              include_prs: Yup.boolean().required(),
+              include_issues: Yup.boolean().required(),
             })}
             initialValues={{
               repo_owner: "",
               repo_name: "",
+              include_prs: true,
+              include_issues: true,
             }}
             refreshFreq={10 * 60} // 10 minutes
-            onSubmit={async (isSuccess, responseJson) => {
-              if (isSuccess && responseJson) {
-                await linkCredential(responseJson.id, githubCredential.id);
-                mutate("/api/manage/admin/connector/indexing-status");
-              }
-            }}
+            credentialId={githubCredential.id}
           />
         </div>
       ) : (

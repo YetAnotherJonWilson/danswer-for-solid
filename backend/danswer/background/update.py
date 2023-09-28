@@ -19,6 +19,7 @@ from danswer.datastores.indexing_pipeline import build_indexing_pipeline
 from danswer.db.connector import disable_connector
 from danswer.db.connector import fetch_connectors
 from danswer.db.connector_credential_pair import get_last_successful_attempt_time
+from danswer.db.connector_credential_pair import mark_all_in_progress_cc_pairs_failed
 from danswer.db.connector_credential_pair import update_connector_credential_pair
 from danswer.db.credentials import backend_update_credential_json
 from danswer.db.engine import get_db_current_time
@@ -35,10 +36,15 @@ from danswer.db.index_attempt import update_docs_indexed
 from danswer.db.models import Connector
 from danswer.db.models import IndexAttempt
 from danswer.db.models import IndexingStatus
+from danswer.search.search_utils import warm_up_models
 from danswer.utils.logger import IndexAttemptSingleton
 from danswer.utils.logger import setup_logger
 
 logger = setup_logger()
+
+_UNEXPECTED_STATE_FAILURE_REASON = (
+    "Stopped mid run, likely due to the background process being killed"
+)
 
 
 def should_create_new_indexing(
@@ -53,43 +59,57 @@ def should_create_new_indexing(
     return time_since_index.total_seconds() >= connector.refresh_freq
 
 
-def create_indexing_jobs(db_session: Session, existing_jobs: dict[int, Future]) -> None:
-    connectors = fetch_connectors(db_session)
-
-    # clean up in-progress jobs that were never completed
-    for connector in connectors:
-        in_progress_indexing_attempts = get_inprogress_index_attempts(
-            connector.id, db_session
+def mark_run_failed(
+    db_session: Session, index_attempt: IndexAttempt, failure_reason: str
+) -> None:
+    """Marks the `index_attempt` row as failed + updates the `
+    connector_credential_pair` to reflect that the run failed"""
+    logger.warning(
+        f"Marking in-progress attempt 'connector: {index_attempt.connector_id}, "
+        f"credential: {index_attempt.credential_id}' as failed due to {failure_reason}"
+    )
+    mark_attempt_failed(
+        index_attempt=index_attempt,
+        db_session=db_session,
+        failure_reason=failure_reason,
+    )
+    if (
+        index_attempt.connector_id is not None
+        and index_attempt.credential_id is not None
+    ):
+        update_connector_credential_pair(
+            db_session=db_session,
+            connector_id=index_attempt.connector_id,
+            credential_id=index_attempt.credential_id,
+            attempt_status=IndexingStatus.FAILED,
         )
-        for attempt in in_progress_indexing_attempts:
-            # if a job is still going, don't touch it
-            if attempt.id in existing_jobs:
-                continue
 
-            logger.warning(
-                f"Marking in-progress attempt 'connector: {attempt.connector_id}, "
-                f"credential: {attempt.credential_id}' as failed"
-            )
-            mark_attempt_failed(
-                attempt,
-                db_session,
-                failure_reason="Stopped mid run, likely due to the background process being killed",
-            )
-            if attempt.connector_id and attempt.credential_id:
-                update_connector_credential_pair(
-                    db_session=db_session,
-                    connector_id=attempt.connector_id,
-                    credential_id=attempt.credential_id,
-                    attempt_status=IndexingStatus.FAILED,
-                )
 
-    # potentially kick off new runs
-    enabled_connectors = [
-        connector for connector in connectors if not connector.disabled
-    ]
+def create_indexing_jobs(db_session: Session, existing_jobs: dict[int, Future]) -> None:
+    """Creates new indexing jobs for each connector / credential pair which is:
+    1. Enabled
+    2. `refresh_frequency` time has passed since the last indexing run for this pair
+    3. There is not already an ongoing indexing attempt for this pair
+    """
+    ongoing_pairs: set[tuple[int | None, int | None]] = set()
+    for attempt_id in existing_jobs:
+        attempt = get_index_attempt(db_session=db_session, index_attempt_id=attempt_id)
+        if attempt is None:
+            logger.error(
+                f"Unable to find IndexAttempt for ID '{attempt_id}' when creating "
+                "indexing jobs"
+            )
+            continue
+        ongoing_pairs.add((attempt.connector_id, attempt.credential_id))
+
+    enabled_connectors = fetch_connectors(db_session, disabled_status=False)
     for connector in enabled_connectors:
         for association in connector.credentials:
             credential = association.credential
+
+            # check if there is an ogoing indexing attempt for this connector + credential pair
+            if (connector.id, credential.id) in ongoing_pairs:
+                continue
 
             last_attempt = get_last_attempt(connector.id, credential.id, db_session)
             if not should_create_new_indexing(connector, last_attempt, db_session):
@@ -109,11 +129,12 @@ def cleanup_indexing_jobs(
 ) -> dict[int, Future]:
     existing_jobs_copy = existing_jobs.copy()
 
+    # clean up completed jobs
     for attempt_id, job in existing_jobs.items():
+        # do nothing for ongoing jobs
         if not job.done():
             continue
 
-        # cleanup completed job
         job.release()
         del existing_jobs_copy[attempt_id]
         index_attempt = get_index_attempt(
@@ -127,21 +148,40 @@ def cleanup_indexing_jobs(
             continue
 
         if index_attempt.status == IndexingStatus.IN_PROGRESS:
-            logger.warning(
-                f"Marking in-progress attempt 'connector: {index_attempt.connector_id}, "
-                f"credential: {index_attempt.credential_id}' as failed"
-            )
-            mark_attempt_failed(
-                index_attempt=index_attempt,
+            mark_run_failed(
                 db_session=db_session,
-                failure_reason="Stopped mid run, likely due to the background process being killed",
+                index_attempt=index_attempt,
+                failure_reason=_UNEXPECTED_STATE_FAILURE_REASON,
             )
-            if index_attempt.connector_id and index_attempt.credential_id:
-                update_connector_credential_pair(
+
+    # clean up in-progress jobs that were never completed
+    connectors = fetch_connectors(db_session)
+    for connector in connectors:
+        in_progress_indexing_attempts = get_inprogress_index_attempts(
+            connector.id, db_session
+        )
+        for index_attempt in in_progress_indexing_attempts:
+            if index_attempt.id in existing_jobs:
+                # check to see if the job has been updated in the last hour, if not
+                # assume it to frozen in some bad state and just mark it as failed. Note: this relies
+                # on the fact that the `time_updated` field is constantly updated every
+                # batch of documents indexed
+                current_db_time = get_db_current_time(db_session=db_session)
+                time_since_update = current_db_time - index_attempt.time_updated
+                if time_since_update.seconds > 60 * 60:
+                    existing_jobs[index_attempt.id].cancel()
+                    mark_run_failed(
+                        db_session=db_session,
+                        index_attempt=index_attempt,
+                        failure_reason="Indexing run frozen - no updates in last hour. "
+                        "The run will be re-attempted at next scheduled indexing time.",
+                    )
+            else:
+                # If job isn't known, simply mark it as failed
+                mark_run_failed(
                     db_session=db_session,
-                    connector_id=index_attempt.connector_id,
-                    credential_id=index_attempt.credential_id,
-                    attempt_status=IndexingStatus.FAILED,
+                    index_attempt=index_attempt,
+                    failure_reason=_UNEXPECTED_STATE_FAILURE_REASON,
                 )
 
     return existing_jobs_copy
@@ -229,6 +269,14 @@ def _run_indexing(
         db_connector = attempt.connector
         db_credential = attempt.credential
 
+        update_connector_credential_pair(
+            db_session=db_session,
+            connector_id=db_connector.id,
+            credential_id=db_credential.id,
+            attempt_status=IndexingStatus.IN_PROGRESS,
+            run_dt=run_dt,
+        )
+
         try:
             net_doc_change = 0
             document_count = 0
@@ -285,6 +333,8 @@ def _run_indexing(
                 f"Failed connector elapsed time: {time.time() - run_time} seconds"
             )
             mark_attempt_failed(attempt, db_session, failure_reason=str(e))
+            # The last attempt won't be marked failed until the next cycle's check for still in-progress attempts
+            # The connector_credential_pair is marked failed here though to reflect correctly in UI asap
             update_connector_credential_pair(
                 db_session=db_session,
                 connector_id=attempt.connector.id,
@@ -396,6 +446,12 @@ def update_loop(delay: int = 10, num_workers: int = NUM_INDEXING_WORKERS) -> Non
     client = Client(cluster)
     existing_jobs: dict[int, Future] = {}
     engine = get_sqlalchemy_engine()
+
+    with Session(engine) as db_session:
+        # Previous version did not always clean up cc-pairs well leaving some connectors undeleteable
+        # This ensures that bad states get cleaned up
+        mark_all_in_progress_cc_pairs_failed(db_session)
+
     while True:
         start = time.time()
         start_time_utc = datetime.utcfromtimestamp(start).strftime("%Y-%m-%d %H:%M:%S")
@@ -417,4 +473,7 @@ def update_loop(delay: int = 10, num_workers: int = NUM_INDEXING_WORKERS) -> Non
 
 
 if __name__ == "__main__":
+    logger.info("Warming up Embedding Model(s)")
+    warm_up_models(indexer_only=True)
+    logger.info("Starting Indexing Loop")
     update_loop()

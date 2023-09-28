@@ -4,18 +4,19 @@ from typing import Protocol
 
 from sqlalchemy.orm import Session
 
+from danswer.access.access import get_access_for_documents
 from danswer.chunking.chunk import Chunker
 from danswer.chunking.chunk import DefaultChunker
+from danswer.chunking.models import DocAwareChunk
+from danswer.chunking.models import DocMetadataAwareIndexChunk
 from danswer.connectors.models import Document
 from danswer.connectors.models import IndexAttemptMetadata
-from danswer.datastores.interfaces import ChunkInsertionRecord
-from danswer.datastores.interfaces import ChunkMetadata
-from danswer.datastores.interfaces import KeywordIndex
-from danswer.datastores.interfaces import StoreType
-from danswer.datastores.interfaces import VectorIndex
-from danswer.datastores.qdrant.store import QdrantIndex
-from danswer.datastores.typesense.store import TypesenseIndex
+from danswer.datastores.document_index import get_default_document_index
+from danswer.datastores.interfaces import DocumentIndex
+from danswer.datastores.interfaces import DocumentMetadata
+from danswer.db.document import prepare_to_modify_documents
 from danswer.db.document import upsert_documents_complete
+from danswer.db.document_set import fetch_document_sets_for_documents
 from danswer.db.engine import get_sqlalchemy_engine
 from danswer.search.models import Embedder
 from danswer.search.semantic_search import DefaultEmbedder
@@ -31,126 +32,119 @@ class IndexingPipelineProtocol(Protocol):
         ...
 
 
-def _upsert_insertion_records(
-    insertion_records: list[ChunkInsertionRecord],
+def _upsert_documents(
+    document_ids: list[str],
     index_attempt_metadata: IndexAttemptMetadata,
-    document_store_type: StoreType,
+    doc_m_data_lookup: dict[str, tuple[str, str]],
+    db_session: Session,
 ) -> None:
-    with Session(get_sqlalchemy_engine()) as session:
-        upsert_documents_complete(
-            db_session=session,
-            document_metadata_batch=[
-                ChunkMetadata(
-                    connector_id=index_attempt_metadata.connector_id,
-                    credential_id=index_attempt_metadata.credential_id,
-                    document_id=insertion_record.document_id,
-                    store_id=insertion_record.store_id,
-                    document_store_type=document_store_type,
-                )
-                for insertion_record in insertion_records
-            ],
-        )
+    upsert_documents_complete(
+        db_session=db_session,
+        document_metadata_batch=[
+            DocumentMetadata(
+                connector_id=index_attempt_metadata.connector_id,
+                credential_id=index_attempt_metadata.credential_id,
+                document_id=document_id,
+                semantic_identifier=doc_m_data_lookup[document_id][0],
+                first_link=doc_m_data_lookup[document_id][1],
+            )
+            for document_id in document_ids
+        ],
+    )
 
 
-def _get_net_new_documents(
-    insertion_records: list[ChunkInsertionRecord],
-) -> int:
-    net_new_documents = 0
-    seen_documents: set[str] = set()
-    for insertion_record in insertion_records:
-        if insertion_record.already_existed:
-            continue
-
-        if insertion_record.document_id not in seen_documents:
-            net_new_documents += 1
-            seen_documents.add(insertion_record.document_id)
-    return net_new_documents
+def _extract_minimal_document_metadata(doc: Document) -> tuple[str, str]:
+    first_link = next((section.link for section in doc.sections if section.link), "")
+    return doc.semantic_identifier, first_link
 
 
 def _indexing_pipeline(
     *,
     chunker: Chunker,
     embedder: Embedder,
-    vector_index: VectorIndex,
-    keyword_index: KeywordIndex,
+    document_index: DocumentIndex,
     documents: list[Document],
     index_attempt_metadata: IndexAttemptMetadata,
 ) -> tuple[int, int]:
     """Takes different pieces of the indexing pipeline and applies it to a batch of documents
     Note that the documents should already be batched at this point so that it does not inflate the
     memory requirements"""
-    # Chunk the documents into reasonably-sized chunks so they can fit into the
-    # context-sizes of our embedding models
-    chunks = list(chain(*[chunker.chunk(document=document) for document in documents]))
-    logger.debug(
-        f"Indexing the following chunks: {[chunk.to_short_descriptor() for chunk in chunks]}"
-    )
+    document_ids = [document.id for document in documents]
+    document_metadata_lookup = {
+        doc.id: _extract_minimal_document_metadata(doc) for doc in documents
+    }
 
-    # Insert the chunks into our Keyword document store + store records of these
-    # documents / chunks into our database
-    # TODO keyword indexing can occur at same time as embedding
-    keyword_store_insertion_records = keyword_index.index(
-        chunks=chunks, index_attempt_metadata=index_attempt_metadata
-    )
-    logger.debug(f"Keyword store insertion records: {keyword_store_insertion_records}")
-    _upsert_insertion_records(
-        insertion_records=keyword_store_insertion_records,
-        index_attempt_metadata=index_attempt_metadata,
-        document_store_type=StoreType.KEYWORD,
-    )
-    net_doc_count_keyword = _get_net_new_documents(
-        insertion_records=keyword_store_insertion_records
-    )
+    with Session(get_sqlalchemy_engine()) as db_session:
+        # acquires a lock on the documents so that no other process can modify them
+        prepare_to_modify_documents(db_session=db_session, document_ids=document_ids)
 
-    # Embed the chunks and then insert them into our Vector document store
-    # + store records of these documents / chunks into our database
-    chunks_with_embeddings = embedder.embed(chunks=chunks)
-    vector_store_insertion_records = vector_index.index(
-        chunks=chunks_with_embeddings, index_attempt_metadata=index_attempt_metadata
-    )
-    logger.debug(f"Vector store insertion records: {keyword_store_insertion_records}")
-    _upsert_insertion_records(
-        insertion_records=vector_store_insertion_records,
-        index_attempt_metadata=index_attempt_metadata,
-        document_store_type=StoreType.VECTOR,
-    )
-    net_doc_count_vector = _get_net_new_documents(
-        insertion_records=vector_store_insertion_records
-    )
+        # create records in the source of truth about these documents
+        _upsert_documents(
+            document_ids=document_ids,
+            index_attempt_metadata=index_attempt_metadata,
+            doc_m_data_lookup=document_metadata_lookup,
+            db_session=db_session,
+        )
 
-    if net_doc_count_vector != net_doc_count_keyword:
-        logger.warning("Document count change from keyword/vector indices don't align")
-    net_new_docs = max(net_doc_count_keyword, net_doc_count_vector)
-    logger.info(f"Indexed {net_new_docs} new documents")
-    return net_new_docs, len(chunks)
+        chunks: list[DocAwareChunk] = list(
+            chain(*[chunker.chunk(document=document) for document in documents])
+        )
+        logger.debug(
+            f"Indexing the following chunks: {[chunk.to_short_descriptor() for chunk in chunks]}"
+        )
+        chunks_with_embeddings = embedder.embed(chunks=chunks)
+
+        # Attach the latest status from Postgres (source of truth for access) to each
+        # chunk. This access status will be attached to each chunk in the document index
+        # TODO: attach document sets to the chunk based on the status of Postgres as well
+        document_id_to_access_info = get_access_for_documents(
+            document_ids=document_ids, db_session=db_session
+        )
+        document_id_to_document_set = {
+            document_id: document_sets
+            for document_id, document_sets in fetch_document_sets_for_documents(
+                document_ids=document_ids, db_session=db_session
+            )
+        }
+        access_aware_chunks = [
+            DocMetadataAwareIndexChunk.from_index_chunk(
+                index_chunk=chunk,
+                access=document_id_to_access_info[chunk.source_document.id],
+                document_sets=set(
+                    document_id_to_document_set.get(chunk.source_document.id, [])
+                ),
+            )
+            for chunk in chunks_with_embeddings
+        ]
+
+        # A document will not be spread across different batches, so all the
+        # documents with chunks in this set, are fully represented by the chunks
+        # in this set
+        insertion_records = document_index.index(
+            chunks=access_aware_chunks,
+        )
+
+    return len([r for r in insertion_records if r.already_existed is False]), len(
+        chunks
+    )
 
 
 def build_indexing_pipeline(
     *,
     chunker: Chunker | None = None,
     embedder: Embedder | None = None,
-    vector_index: VectorIndex | None = None,
-    keyword_index: KeywordIndex | None = None,
+    document_index: DocumentIndex | None = None,
 ) -> IndexingPipelineProtocol:
-    """Builds a pipeline which takes in a list (batch) of docs and indexes them.
+    """Builds a pipline which takes in a list (batch) of docs and indexes them."""
+    chunker = chunker or DefaultChunker()
 
-    Default uses _ chunker, _ embedder, and qdrant for the datastore"""
-    if chunker is None:
-        chunker = DefaultChunker()
+    embedder = embedder or DefaultEmbedder()
 
-    if embedder is None:
-        embedder = DefaultEmbedder()
-
-    if vector_index is None:
-        vector_index = QdrantIndex()
-
-    if keyword_index is None:
-        keyword_index = TypesenseIndex()
+    document_index = document_index or get_default_document_index()
 
     return partial(
         _indexing_pipeline,
         chunker=chunker,
         embedder=embedder,
-        vector_index=vector_index,
-        keyword_index=keyword_index,
+        document_index=document_index,
     )
